@@ -20,6 +20,28 @@ A redundancia funciona porque varias maquinas podem rodar o mesmo agente. O equi
 
 O agente nao precisa instalar pacotes externos.
 
+## Estrutura atual do painel
+
+O projeto `Painel-Manutencao-Motiva-Parana` usa o Supabase assim:
+
+- tabela: `app_state`
+- linha principal: `id = main`
+- dados: coluna `data` do tipo `jsonb`
+- equipamentos: `data.equipments`
+
+Cada equipamento no JSON possui campos como:
+
+- `id`
+- `identification`
+- `equipmentName`
+- `ip`
+- `status`
+- `scope`
+- `locationId`
+- `typeId`
+
+Por isso, o agente vem configurado por padrao com `SOURCE_MODE=app_state`.
+
 ## Configuracao
 
 Crie um arquivo `.env` baseado no exemplo:
@@ -27,6 +49,10 @@ Crie um arquivo `.env` baseado no exemplo:
 ```env
 SUPABASE_URL=https://seu-projeto.supabase.co
 SUPABASE_KEY=sua-chave-service-role-ou-chave-com-permissao
+
+SOURCE_MODE=app_state
+APP_STATE_TABLE=app_state
+APP_STATE_ROW_ID=main
 
 EQUIPMENT_TABLE=equipamentos
 EQUIPMENT_ID_COLUMN=id
@@ -45,13 +71,17 @@ HTTP_HOST=127.0.0.1
 HTTP_PORT=8765
 ```
 
-Se a tabela de equipamentos do seu painel tiver outros nomes de colunas, ajuste as variaveis `EQUIPMENT_*`.
+As variaveis `EQUIPMENT_*` ficam reservadas para um formato futuro com tabela propria de equipamentos. No painel atual, o agente le direto de `app_state.data.equipments`.
 
 ## Banco de dados
 
 Execute o conteudo de `sql/schema.sql` no Supabase SQL Editor.
 
-Depois, adapte a tabela de equipamentos usada pelo agente. Por padrao ele procura:
+O agente grava os resultados na tabela `monitoramento_ping_resultados`.
+
+No formato atual do painel, ele busca os equipamentos dentro de `app_state.data.equipments`.
+
+Se futuramente voce migrar para uma tabela propria de equipamentos, altere `SOURCE_MODE=table` e ajuste:
 
 - tabela: `equipamentos`
 - id: `id`
@@ -66,6 +96,16 @@ python agent.py run
 ```
 
 Ele faz um ping automaticamente na proxima janela fechada. Exemplo: se iniciar `10:08`, o primeiro ciclo automatico sera `10:30`.
+
+Com o agente rodando, abra a tela de controle local:
+
+```text
+http://127.0.0.1:8765/
+```
+
+Ou de dois cliques em `abrir-interface-agente.vbs`.
+
+Para instrucoes completas de ativacao pelo PowerShell, modo discreto e Agendador de Tarefas do Windows, consulte `ORIENTACOES-ATIVAR-AGENTE.md`.
 
 ## Forcar ping imediato
 
@@ -96,4 +136,3 @@ Use a view `monitoramento_status_atual` como fonte do painel:
 - sem linha recente: nenhum agente registrou resultado recentemente; isso indica problema no monitoramento ou agentes parados.
 
 Para evitar falso offline no minuto exato da virada da janela, o painel pode mostrar a ultima janela concluida ou aguardar alguns minutos de tolerancia.
-

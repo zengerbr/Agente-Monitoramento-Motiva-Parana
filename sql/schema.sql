@@ -1,8 +1,10 @@
+drop view if exists public.monitoramento_status_atual;
+
 create table if not exists public.monitoramento_ping_resultados (
   id bigint generated always as identity primary key,
   equipamento_id text not null,
   equipamento_nome text,
-  ip inet not null,
+  ip text not null,
   agente_id text not null,
   janela_inicio timestamptz not null,
   sucesso boolean not null,
@@ -12,6 +14,33 @@ create table if not exists public.monitoramento_ping_resultados (
   criado_em timestamptz not null default now(),
   unique (equipamento_id, agente_id, janela_inicio, motivo)
 );
+
+alter table public.monitoramento_ping_resultados
+  alter column ip type text using ip::text;
+
+alter table public.monitoramento_ping_resultados enable row level security;
+
+drop policy if exists "motiva_ping_read" on public.monitoramento_ping_resultados;
+create policy "motiva_ping_read"
+on public.monitoramento_ping_resultados
+for select
+to anon
+using (true);
+
+drop policy if exists "motiva_ping_insert" on public.monitoramento_ping_resultados;
+create policy "motiva_ping_insert"
+on public.monitoramento_ping_resultados
+for insert
+to anon
+with check (true);
+
+drop policy if exists "motiva_ping_update" on public.monitoramento_ping_resultados;
+create policy "motiva_ping_update"
+on public.monitoramento_ping_resultados
+for update
+to anon
+using (true)
+with check (true);
 
 create index if not exists idx_ping_resultados_janela
   on public.monitoramento_ping_resultados (janela_inicio desc);
@@ -28,7 +57,7 @@ resumo as (
   select
     r.equipamento_id,
     max(r.equipamento_nome) as equipamento_nome,
-    max(r.ip::text) as ip,
+    max(r.ip) as ip,
     r.janela_inicio,
     bool_or(r.sucesso) as online,
     count(*) as total_respostas,
@@ -48,4 +77,3 @@ comment on table public.monitoramento_ping_resultados is
 
 comment on view public.monitoramento_status_atual is
   'Status consolidado da ultima janela: online quando qualquer agente teve sucesso.';
-
