@@ -9,6 +9,10 @@ A redundancia funciona porque varias maquinas podem rodar o mesmo agente. O equi
 ## Arquivos
 
 - `agent.py`: servico principal do agente.
+- `INICIAR_AGENTE.bat`: acionador principal. Usa `python-portatil\python.exe` se existir; caso contrario tenta usar o Python instalado no Windows.
+- `iniciar-agente-discreto.vbs`: inicia o agente sem deixar janela do terminal aberta.
+- `ABRIR_INTERFACE.bat` e `abrir-interface-agente.vbs`: abrem a interface local em `http://127.0.0.1:8765/`.
+- `python-portatil/`: pasta opcional para colocar o Python portatil em maquinas sem Python instalado.
 - `.env.example`: exemplo de configuracao.
 - `sql/schema.sql`: tabelas e views sugeridas para o Supabase.
 
@@ -91,6 +95,20 @@ Se futuramente voce migrar para uma tabela propria de equipamentos, altere `SOUR
 
 ## Rodar o agente
 
+Modo recomendado no Windows:
+
+```text
+INICIAR_AGENTE.bat
+```
+
+Esse acionador procura automaticamente:
+
+1. `python-portatil\python.exe`, se voce colocou um Python portatil na pasta do agente.
+2. `python`, se o Python estiver instalado no Windows.
+3. `py -3`, se o Python Launcher estiver disponivel.
+
+Tambem e possivel iniciar manualmente pelo terminal:
+
 ```powershell
 python agent.py run
 ```
@@ -136,3 +154,5 @@ Use a view `monitoramento_status_atual` como fonte do painel:
 - sem linha recente: nenhum agente registrou resultado recentemente; isso indica problema no monitoramento ou agentes parados.
 
 Para evitar falso offline no minuto exato da virada da janela, o painel pode mostrar a ultima janela concluida ou aguardar alguns minutos de tolerancia.
+
+

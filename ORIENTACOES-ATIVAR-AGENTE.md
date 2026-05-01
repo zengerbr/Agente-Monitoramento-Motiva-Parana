@@ -6,7 +6,7 @@ Este agente deve rodar em uma maquina com acesso a VPN/rede da empresa.
 
 Confira estes pontos:
 
-- Python instalado na maquina.
+- Python instalado na maquina, ou Python portatil colocado em `python-portatil\python.exe`.
 - A pasta do agente copiada para a maquina.
 - Arquivo `.env` preenchido dentro da pasta do agente.
 - VPN/rede da empresa conectada.
@@ -26,6 +26,30 @@ AGENT_ID=maquina-vpn-02
 
 Isso permite saber qual maquina respondeu cada ping.
 
+
+## Acionador principal
+
+Na raiz da pasta existe o arquivo:
+
+```text
+INICIAR_AGENTE.bat
+```
+
+Ele e o arquivo principal para iniciar o agente.
+
+Ao executar, ele procura automaticamente:
+
+1. `python-portatil\python.exe`, se existir.
+2. `python`, se o Python estiver instalado no Windows.
+3. `py -3`, se o Python Launcher estiver disponivel.
+
+Isso permite usar a mesma pasta em dois cenarios:
+
+- computador com Python instalado normalmente;
+- computador com restricao, usando Python portatil dentro da pasta `python-portatil`.
+
+A pasta `python-portatil` e opcional. Se ela estiver vazia, o agente tenta usar o Python instalado no Windows.
+
 ## Modo 1: iniciar normal pelo PowerShell
 
 Abra o PowerShell e entre na pasta do agente:
@@ -34,7 +58,13 @@ Abra o PowerShell e entre na pasta do agente:
 cd "C:\Users\Junior\Documents\01_Projetos Codex\Agente-Monitoramento-Motiva-Parana"
 ```
 
-Inicie o agente:
+Inicie o agente pelo acionador principal:
+
+```powershell
+.\INICIAR_AGENTE.bat
+```
+
+Ou, se preferir chamar o Python diretamente:
 
 ```powershell
 python agent.py run
@@ -88,10 +118,10 @@ iniciar-agente-discreto.vbs
 
 Para iniciar o agente de forma discreta, de dois cliques nesse arquivo.
 
-Ele executa:
+Ele chama o arquivo:
 
-```powershell
-python agent.py run
+```text
+INICIAR_AGENTE.bat
 ```
 
 mas sem deixar janela do PowerShell aberta.
@@ -134,18 +164,16 @@ Na aba `Acoes`:
 
 1. Clique em `Novo...`.
 2. Em `Acao`, deixe `Iniciar um programa`.
-3. Em `Programa/script`, coloque o caminho do Python.
-
-Exemplo:
+3. Em `Programa/script`, coloque:
 
 ```text
-C:\Users\Junior\AppData\Local\Programs\Python\Python313\python.exe
+cmd.exe
 ```
 
 4. Em `Adicionar argumentos`, coloque:
 
 ```text
-agent.py run
+/c "INICIAR_AGENTE.bat"
 ```
 
 5. Em `Iniciar em`, coloque a pasta do agente:
@@ -239,3 +267,5 @@ Ctrl + C
 ```
 
 Se estiver rodando pelo `.vbs` ou pelo Agendador de Tarefas, encerre pelo Gerenciador de Tarefas procurando por `python.exe`, ou finalize a tarefa pelo Agendador.
+
+

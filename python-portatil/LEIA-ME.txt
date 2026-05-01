@@ -1,0 +1,19 @@
+# Python portatil
+
+Esta pasta e opcional.
+
+Use somente nos computadores onde o Python nao estiver instalado no Windows.
+
+Como usar:
+
+1. Coloque aqui os arquivos do Python portatil.
+2. Confirme que existe este arquivo:
+
+   python-portatil\python.exe
+
+3. Execute o arquivo da raiz:
+
+   INICIAR_AGENTE.bat
+
+Se esse python.exe existir, o agente usa ele automaticamente.
+Se nao existir, o agente tenta usar o Python instalado no Windows.

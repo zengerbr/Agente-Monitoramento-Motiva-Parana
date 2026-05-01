@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -9,6 +9,7 @@ import socket
 import subprocess
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,6 +73,32 @@ def normalize_agent_id(value: str) -> str:
     if len(normalized) > 80:
         raise ValueError("O ID do agente deve ter no maximo 80 caracteres.")
     return normalized
+
+AGENT_AUTO_ID_RE = re.compile(r"^maquina-(\d{2})(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$")
+
+
+def normalize_agent_suffix(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value.strip().lower())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
+    normalized = normalized.strip("-")
+    if len(normalized) > 40:
+        normalized = normalized[:40].strip("-")
+    return normalized
+
+
+def compose_agent_id(auto_id: str, suffix: str = "") -> str:
+    suffix = normalize_agent_suffix(suffix)
+    return f"{auto_id}-{suffix}" if suffix else auto_id
+
+
+def split_agent_id(agent_id: str) -> tuple[str, str]:
+    match = AGENT_AUTO_ID_RE.match(agent_id.strip().lower())
+    if not match:
+        return "", normalize_agent_suffix(agent_id)
+    base = f"maquina-{match.group(1)}"
+    suffix = agent_id[len(base):].lstrip("-")
+    return base, normalize_agent_suffix(suffix)
 
 
 @dataclass(frozen=True)
@@ -209,6 +236,27 @@ class SupabaseRestClient:
         )
         self._request("POST", f"{self.config.results_table}?{params}", rows)
 
+    def fetch_recent_agent_ids(self, minutes: int = 30) -> list[str]:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        table = urllib.parse.quote(self.config.results_table, safe="")
+        query = urllib.parse.urlencode(
+            {
+                "select": "agente_id,criado_em",
+                "criado_em": f"gte.{since}",
+                "order": "criado_em.desc",
+                "limit": "500",
+            }
+        )
+        rows = self._request("GET", f"{table}?{query}") or []
+        agent_ids: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            agent_id = str(row.get("agente_id", "")).strip()
+            if agent_id and agent_id not in seen:
+                seen.add(agent_id)
+                agent_ids.append(agent_id)
+        return agent_ids
+
 
 @dataclass(frozen=True)
 class PingResult:
@@ -277,7 +325,53 @@ class MonitoringAgent:
         self.last_run: dict[str, Any] | None = None
         self.scheduler_enabled = True
         self.started_at = datetime.now(self.timezone)
+        self.active_agent_ids: list[str] = []
+        self._ensure_agent_identity()
 
+    def _ensure_agent_identity(self) -> None:
+        hostname = socket.gethostname().strip().lower()
+        current_auto = os.getenv("AGENT_AUTO_ID", "").strip().lower()
+        current_host = os.getenv("AGENT_MACHINE_HOST", "").strip().lower()
+        current_suffix = normalize_agent_suffix(os.getenv("AGENT_NAME_SUFFIX", ""))
+
+        legacy_base, legacy_suffix = split_agent_id(self.config.agent_id)
+        if not current_suffix and legacy_suffix and not legacy_suffix.startswith("vpn"):
+            current_suffix = legacy_suffix
+
+        try:
+            self.active_agent_ids = self.client.fetch_recent_agent_ids()
+        except Exception as exc:
+            self.active_agent_ids = []
+            print(f"Nao foi possivel consultar agentes ativos: {exc}")
+
+        if not current_auto or current_host != hostname:
+            current_auto = self._next_auto_agent_id(self.active_agent_ids)
+            update_dotenv_value("AGENT_AUTO_ID", current_auto)
+            update_dotenv_value("AGENT_MACHINE_HOST", hostname)
+            update_dotenv_value("AGENT_NAME_SUFFIX", current_suffix)
+
+        final_id = compose_agent_id(current_auto, current_suffix)
+        update_dotenv_value("AGENT_ID", final_id)
+        object.__setattr__(self.config, "agent_id", final_id)
+
+    def _next_auto_agent_id(self, active_agent_ids: list[str]) -> str:
+        used = set()
+        for agent_id in active_agent_ids:
+            match = AGENT_AUTO_ID_RE.match(agent_id.strip().lower())
+            if match:
+                used.add(int(match.group(1)))
+        for number in range(1, 100):
+            if number not in used:
+                return f"maquina-{number:02d}"
+        return "maquina-99"
+
+    def _agent_identity(self) -> dict[str, str]:
+        auto_id, suffix = split_agent_id(self.config.agent_id)
+        return {
+            "auto_id": auto_id or os.getenv("AGENT_AUTO_ID", ""),
+            "suffix": suffix or normalize_agent_suffix(os.getenv("AGENT_NAME_SUFFIX", "")),
+            "final_id": self.config.agent_id,
+        }
     def _load_timezone(self, timezone_name: str) -> timezone:
         try:
             return ZoneInfo(timezone_name)
@@ -356,9 +450,16 @@ class MonitoringAgent:
     def get_status(self) -> dict[str, Any]:
         now = datetime.now(self.timezone)
         running = self.lock.locked()
+        try:
+            self.active_agent_ids = self.client.fetch_recent_agent_ids()
+        except Exception:
+            pass
+        identity = self._agent_identity()
         return {
             "ok": True,
             "agent_id": self.config.agent_id,
+            "agent_identity": identity,
+            "active_agents": self.active_agent_ids,
             "scheduler_enabled": self.scheduler_enabled,
             "running_cycle": running,
             "started_at": self.started_at.isoformat(),
@@ -382,10 +483,15 @@ class MonitoringAgent:
         self.scheduler_enabled = False
         return self.get_status()
 
-    def update_agent_id(self, agent_id: str) -> dict[str, Any]:
-        normalized = normalize_agent_id(agent_id)
-        update_dotenv_value("AGENT_ID", normalized)
-        object.__setattr__(self.config, "agent_id", normalized)
+    def update_agent_id(self, agent_id: str = "", suffix: str = "") -> dict[str, Any]:
+        identity = self._agent_identity()
+        auto_id = identity["auto_id"] or self._next_auto_agent_id(self.active_agent_ids)
+        next_suffix = normalize_agent_suffix(suffix if suffix != "" else agent_id)
+        final_id = compose_agent_id(auto_id, next_suffix)
+        update_dotenv_value("AGENT_AUTO_ID", auto_id)
+        update_dotenv_value("AGENT_NAME_SUFFIX", next_suffix)
+        update_dotenv_value("AGENT_ID", final_id)
+        object.__setattr__(self.config, "agent_id", final_id)
         return self.get_status()
 
     def _equipment_fields(self, item: dict[str, Any]) -> tuple[str, str, str | None]:
@@ -442,7 +548,7 @@ class MonitoringAgent:
                 if path == "/api/config":
                     payload = self._read_json()
                     try:
-                        self._send(200, agent.update_agent_id(str(payload.get("agent_id", ""))))
+                        self._send(200, agent.update_agent_id(str(payload.get("agent_id", "")), str(payload.get("agent_suffix", ""))))
                     except ValueError as exc:
                         self._send(400, {"ok": False, "message": str(exc)})
                     return
@@ -502,12 +608,12 @@ class MonitoringAgent:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agente de Monitoramento Motiva Parana</title>
+  <title>Agente de Monitoramento</title>
   <style>
     :root {
-      color-scheme: light;
       --bg: #f5f3fb;
       --panel: #ffffff;
+      --panel-soft: #f8f5ff;
       --text: #211833;
       --muted: #6d6384;
       --line: #e5def4;
@@ -515,197 +621,65 @@ class MonitoringAgent:
       --primary-dark: #4320aa;
       --ok: #11845b;
       --bad: #c6344a;
-      --warn: #a66b00;
+      --warn: #d88716;
+      --shadow: 0 18px 42px rgba(67, 32, 170, 0.12);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
-      background: var(--bg);
+      background: linear-gradient(180deg, #fbfaff 0%, var(--bg) 100%);
       color: var(--text);
       font-family: Arial, Helvetica, sans-serif;
     }
-    main {
-      width: min(980px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 28px 0;
-    }
-    header {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 18px;
-      margin-bottom: 18px;
-    }
-    h1 {
-      margin: 0 0 6px;
-      font-size: 28px;
-      line-height: 1.1;
-    }
-    p { margin: 0; color: var(--muted); }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      border-radius: 999px;
-      padding: 7px 12px;
-      background: #ece6fb;
-      color: var(--primary-dark);
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin: 18px 0;
-    }
-    .card, .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: 0 12px 32px rgba(67, 32, 170, 0.08);
-    }
-    .card { padding: 16px; min-height: 98px; }
-    .card small {
-      display: block;
-      color: var(--muted);
-      font-weight: 700;
-      margin-bottom: 10px;
-      text-transform: uppercase;
-      font-size: 11px;
-    }
-    .card strong {
-      display: block;
-      font-size: 23px;
-      line-height: 1.1;
-      overflow-wrap: anywhere;
-    }
-    .panel { padding: 18px; margin-top: 12px; }
-    .tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin: 18px 0 6px;
-    }
-    .tab-button {
-      background: #ece6fb;
-      color: var(--primary-dark);
-      min-height: 38px;
-    }
-    .tab-button.is-active {
-      background: var(--primary);
-      color: white;
-    }
-    .tab-panel[hidden] { display: none; }
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 16px;
-    }
-    button, a.button {
-      border: 0;
-      border-radius: 8px;
-      min-height: 42px;
-      padding: 0 16px;
-      background: var(--primary);
-      color: white;
-      font-weight: 700;
-      cursor: pointer;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-    button:hover, a.button:hover { background: var(--primary-dark); }
+    main { width: min(1120px, calc(100% - 28px)); margin: 0 auto; padding: 24px 0; }
+    header, .panel, .metric-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); }
+    header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 18px; margin-bottom: 14px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: 28px; line-height: 1.1; }
+    h2 { font-size: 22px; margin-bottom: 6px; }
+    h3 { font-size: 15px; }
+    p, .muted { color: var(--muted); }
+    .agent-badge { display: grid; gap: 4px; justify-items: end; }
+    .agent-badge span { color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+    .agent-badge strong { padding: 9px 12px; border-radius: 999px; background: #ece6fb; color: var(--primary-dark); overflow-wrap: anywhere; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    button { border: 0; border-radius: 12px; min-height: 42px; padding: 0 16px; background: var(--primary); color: white; font-weight: 800; cursor: pointer; }
+    button:hover { background: var(--primary-dark); }
     button.secondary { background: #ece6fb; color: var(--primary-dark); }
     button.secondary:hover { background: #ddd2f7; }
     button.danger { background: #c6344a; }
-    button.danger:hover { background: #a5283a; }
-    button:disabled {
-      cursor: wait;
-      opacity: 0.65;
-    }
-    label {
-      display: grid;
-      gap: 8px;
-      color: var(--muted);
-      font-weight: 700;
-      margin-top: 14px;
-    }
-    input {
-      width: 100%;
-      min-height: 42px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 0 12px;
-      color: var(--text);
-      font: inherit;
-      font-weight: 600;
-      background: white;
-    }
-    .note {
-      margin-top: 10px;
-      padding: 12px;
-      border-radius: 8px;
-      background: #f7f3ff;
-      border: 1px solid var(--line);
-      color: var(--muted);
-    }
-    .steps {
-      margin: 12px 0 0;
-      padding-left: 20px;
-      color: var(--text);
-      line-height: 1.55;
-    }
-    code {
-      background: #f0eafa;
-      color: var(--primary-dark);
-      border-radius: 5px;
-      padding: 2px 5px;
-    }
+    button:disabled { cursor: wait; opacity: .65; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .metric-card { padding: 16px; min-height: 116px; display: grid; align-content: space-between; }
+    .metric-card small { color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; }
+    .metric-card strong { font-size: 24px; line-height: 1.1; overflow-wrap: anywhere; }
+    .metric-card span { color: var(--muted); font-weight: 700; }
+    .panel { padding: 18px; margin-top: 14px; }
+    .status-dot { display: inline-flex; align-items: center; gap: 7px; }
+    .status-dot::before { content: ""; width: 9px; height: 9px; border-radius: 999px; background: currentColor; box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 14%, transparent); }
     .status-ok { color: var(--ok); }
     .status-bad { color: var(--bad); }
     .status-warn { color: var(--warn); }
-    .log {
-      margin-top: 14px;
-      padding: 14px;
-      border-radius: 8px;
-      background: #171421;
-      color: #f7f2ff;
-      min-height: 130px;
-      overflow: auto;
-      font-size: 13px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
-    }
-    th, td {
-      text-align: left;
-      border-bottom: 1px solid var(--line);
-      padding: 11px 8px;
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0;
-    }
-    @media (max-width: 760px) {
-      header { display: block; }
-      .pill { margin-top: 12px; }
-      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 460px) {
-      .grid { grid-template-columns: 1fr; }
-      button, a.button { width: 100%; }
-    }
+    .status-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .status-item { padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-soft); }
+    .status-item small { display: block; color: var(--muted); font-weight: 800; text-transform: uppercase; font-size: 11px; margin-bottom: 6px; }
+    .agent-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .agent-chip { padding: 7px 10px; border-radius: 999px; background: #ece6fb; color: var(--primary-dark); font-weight: 800; font-size: 13px; }
+    .identity-grid { display: grid; grid-template-columns: minmax(180px, .55fr) minmax(0, 1fr) auto; gap: 12px; align-items: end; margin-top: 14px; }
+    label { display: grid; gap: 7px; color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
+    input { width: 100%; min-height: 42px; border: 1px solid var(--line); border-radius: 12px; padding: 0 12px; color: var(--text); background: white; font: inherit; font-weight: 700; }
+    input[readonly] { background: #f1ecfb; color: var(--primary-dark); }
+    .final-name { margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-soft); color: var(--muted); }
+    .final-name strong { color: var(--text); }
+    .message { margin-top: 10px; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 11px 8px; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    .steps { margin: 12px 0 0; padding-left: 20px; color: var(--text); line-height: 1.55; }
+    code { background: #f0eafa; color: var(--primary-dark); border-radius: 5px; padding: 2px 5px; }
+    @media (max-width: 850px) { header, .identity-grid { grid-template-columns: 1fr; } .agent-badge { justify-items: start; } .grid, .status-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 520px) { main { width: min(100% - 18px, 1120px); } .grid, .status-list { grid-template-columns: 1fr; } button { width: 100%; } }
   </style>
 </head>
 <body>
@@ -714,75 +688,45 @@ class MonitoringAgent:
       <div>
         <h1>Agente de Monitoramento</h1>
         <p>Controle local dos pings enviados ao Supabase.</p>
+        <div class="toolbar">
+          <button type="button" id="startButton">Ligar automatico</button>
+          <button type="button" class="danger" id="stopButton">Desligar automatico</button>
+          <button type="button" class="secondary" id="forceButton">Forcar ping agora</button>
+          <button type="button" class="secondary" id="refreshButton">Atualizar</button>
+        </div>
       </div>
-      <span class="pill" id="agentId">Carregando...</span>
+      <div class="agent-badge">
+        <span>Agente ativo</span>
+        <strong id="agentId">Carregando...</strong>
+      </div>
     </header>
 
     <section class="grid" aria-label="Resumo">
-      <article class="card">
-        <small>Automático</small>
-        <strong id="scheduler">-</strong>
-      </article>
-      <article class="card">
-        <small>Ciclo atual</small>
-        <strong id="running">-</strong>
-      </article>
-      <article class="card">
-        <small>Próximo ping</small>
-        <strong id="nextPing">-</strong>
-      </article>
-      <article class="card">
-        <small>Último resultado</small>
-        <strong id="lastSummary">-</strong>
-      </article>
-    </section>
-
-    <nav class="tabs" aria-label="Seções do agente">
-      <button class="tab-button is-active" type="button" data-tab="control">Controle</button>
-      <button class="tab-button" type="button" data-tab="settings">Configurações</button>
-      <button class="tab-button" type="button" data-tab="instructions">Instruções</button>
-    </nav>
-
-    <section class="panel tab-panel" id="tab-control">
-      <h2>Controle</h2>
-      <p>Ligar pausa/retoma os pings automáticos. Forçar ping executa uma validação imediata.</p>
-      <div class="actions">
-        <button type="button" id="startButton">Ligar automático</button>
-        <button type="button" class="danger" id="stopButton">Desligar automático</button>
-        <button type="button" class="secondary" id="forceButton">Forçar ping agora</button>
-        <button type="button" class="secondary" id="refreshButton">Atualizar status</button>
-      </div>
-      <div class="log" id="log">Carregando status...</div>
-    </section>
-
-    <section class="panel tab-panel" id="tab-settings" hidden>
-      <h2>Configurações</h2>
-      <p>Use um ID diferente em cada máquina para identificar quem respondeu ao ping.</p>
-      <label>
-        ID do agente
-        <input id="agentIdInput" type="text" autocomplete="off" placeholder="maquina-vpn-01">
-      </label>
-      <div class="actions">
-        <button type="button" id="saveConfigButton">Salvar ID</button>
-      </div>
-      <p class="note" id="configMessage">Use letras, números, ponto, hífen ou underline. Exemplo: <code>maquina-vpn-02</code>.</p>
-    </section>
-
-    <section class="panel tab-panel" id="tab-instructions" hidden>
-      <h2>Instruções</h2>
-      <ol class="steps">
-        <li>Deixe a VPN/rede da empresa conectada nesta máquina.</li>
-        <li>Com o automático ligado, o agente pinga nas janelas fechadas, como <code>10:00</code>, <code>10:30</code> e <code>11:00</code>.</li>
-        <li>Use <strong>Forçar ping agora</strong> quando quiser validar imediatamente todos os equipamentos.</li>
-        <li>O painel principal lê o resultado salvo no Supabase. Máquinas sem agente instalado apenas visualizam o status.</li>
-        <li>Para rodar discreto, use o arquivo <code>iniciar-agente-discreto.vbs</code>.</li>
-        <li>Para abrir esta tela sem digitar endereço, use <code>abrir-interface-agente.vbs</code>.</li>
-      </ol>
-      <p class="note">A rota <code>/health</code> é técnica e mostra JSON. A interface amigável fica em <code>http://127.0.0.1:8765/</code>.</p>
+      <article class="metric-card"><small>Automatico</small><strong id="scheduler">-</strong><span id="schedulerHint">-</span></article>
+      <article class="metric-card"><small>Ciclo atual</small><strong id="running">-</strong><span id="runningHint">-</span></article>
+      <article class="metric-card"><small>Proximo ping</small><strong id="nextPing">-</strong><span>Janela programada</span></article>
+      <article class="metric-card"><small>Ultimo monitoramento</small><strong id="lastSummary">-</strong><span id="lastFinished">-</span></article>
     </section>
 
     <section class="panel">
-      <h2>Detalhes</h2>
+      <h2>Identificacao do agente</h2>
+      <p>O ID automatico evita nomes repetidos entre maquinas. Edite somente o complemento para identificar o local.</p>
+      <div class="identity-grid">
+        <label>ID automatico<input id="agentAutoIdInput" type="text" readonly></label>
+        <label>Identificacao da maquina<input id="agentSuffixInput" type="text" autocomplete="off" placeholder="sertaneja"></label>
+        <button type="button" id="saveConfigButton">Salvar nome</button>
+      </div>
+      <div class="final-name">Nome final do agente: <strong id="finalAgentName">-</strong></div>
+      <p class="message" id="configMessage">Use apenas letras minusculas, numeros e hifen. Maiusculas, acentos e simbolos sao ajustados automaticamente.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Monitoramento</h2>
+      <div class="status-list">
+        <div class="status-item"><small>Equipamentos</small><strong id="equipmentCount">-</strong></div>
+        <div class="status-item"><small>Online no ultimo ping</small><strong class="status-ok" id="onlineCount">-</strong></div>
+        <div class="status-item"><small>Offline no ultimo ping</small><strong class="status-bad" id="offlineCount">-</strong></div>
+      </div>
       <table>
         <tbody>
           <tr><th>Iniciado em</th><td id="startedAt">-</td></tr>
@@ -793,139 +737,58 @@ class MonitoringAgent:
         </tbody>
       </table>
     </section>
+
+    <section class="panel">
+      <h2>Agentes vistos recentemente</h2>
+      <p>Lista baseada nos resultados enviados nos ultimos 30 minutos.</p>
+      <div class="agent-row" id="activeAgents"><span class="agent-chip">Carregando...</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Instrucoes</h2>
+      <ol class="steps">
+        <li>Deixe a VPN/rede da empresa conectada nesta maquina.</li>
+        <li>Com o automatico ligado, o agente pinga em janelas como <code>10:00</code>, <code>10:30</code> e <code>11:00</code>.</li>
+        <li>Use <strong>Forcar ping agora</strong> para validar imediatamente todos os equipamentos.</li>
+        <li>A rota <code>/health</code> continua disponivel para uso tecnico em JSON.</li>
+      </ol>
+    </section>
   </main>
 
   <script>
     const nodes = {
-      agentId: document.getElementById("agentId"),
-      scheduler: document.getElementById("scheduler"),
-      running: document.getElementById("running"),
-      nextPing: document.getElementById("nextPing"),
-      lastSummary: document.getElementById("lastSummary"),
-      startedAt: document.getElementById("startedAt"),
-      now: document.getElementById("now"),
-      sourceMode: document.getElementById("sourceMode"),
-      interval: document.getElementById("interval"),
-      timeout: document.getElementById("timeout"),
-      log: document.getElementById("log"),
-      agentIdInput: document.getElementById("agentIdInput"),
-      saveConfigButton: document.getElementById("saveConfigButton"),
-      configMessage: document.getElementById("configMessage"),
-      startButton: document.getElementById("startButton"),
-      stopButton: document.getElementById("stopButton"),
-      forceButton: document.getElementById("forceButton"),
-      refreshButton: document.getElementById("refreshButton"),
+      agentId: document.getElementById("agentId"), agentAutoIdInput: document.getElementById("agentAutoIdInput"), agentSuffixInput: document.getElementById("agentSuffixInput"), finalAgentName: document.getElementById("finalAgentName"), configMessage: document.getElementById("configMessage"),
+      scheduler: document.getElementById("scheduler"), schedulerHint: document.getElementById("schedulerHint"), running: document.getElementById("running"), runningHint: document.getElementById("runningHint"), nextPing: document.getElementById("nextPing"), lastSummary: document.getElementById("lastSummary"), lastFinished: document.getElementById("lastFinished"),
+      equipmentCount: document.getElementById("equipmentCount"), onlineCount: document.getElementById("onlineCount"), offlineCount: document.getElementById("offlineCount"), activeAgents: document.getElementById("activeAgents"),
+      startedAt: document.getElementById("startedAt"), now: document.getElementById("now"), sourceMode: document.getElementById("sourceMode"), interval: document.getElementById("interval"), timeout: document.getElementById("timeout"),
+      startButton: document.getElementById("startButton"), stopButton: document.getElementById("stopButton"), forceButton: document.getElementById("forceButton"), refreshButton: document.getElementById("refreshButton"), saveConfigButton: document.getElementById("saveConfigButton"),
     };
-
-    function formatDate(value) {
-      if (!value) return "-";
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return value;
-      return date.toLocaleString("pt-BR");
-    }
-
-    function setBusy(isBusy) {
-      nodes.startButton.disabled = isBusy;
-      nodes.stopButton.disabled = isBusy;
-      nodes.forceButton.disabled = isBusy;
-      nodes.refreshButton.disabled = isBusy;
-    }
-
+    function sanitizeSuffix(value) { return String(value || "").toLowerCase().normalize("NFD").replace(/[\\u0300-\\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/g, ""); }
+    function composeName() { const base = nodes.agentAutoIdInput.value || "maquina-01"; const suffix = sanitizeSuffix(nodes.agentSuffixInput.value); return suffix ? `${base}-${suffix}` : base; }
+    function syncFinalName() { nodes.agentSuffixInput.value = sanitizeSuffix(nodes.agentSuffixInput.value); nodes.finalAgentName.textContent = composeName(); }
+    function formatDate(value) { if (!value) return "-"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("pt-BR"); }
+    function formatShort(value) { if (!value) return "-"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }); }
+    function setBusy(isBusy) { [nodes.startButton,nodes.stopButton,nodes.forceButton,nodes.refreshButton,nodes.saveConfigButton].forEach((button) => button.disabled = isBusy); }
+    function renderAgents(items, current) { const agents = Array.isArray(items) && items.length ? items : [current].filter(Boolean); nodes.activeAgents.innerHTML = agents.map((id) => `<span class="agent-chip">${id === current ? "Atual: " : ""}${id}</span>`).join("") || '<span class="agent-chip">Sem registros recentes</span>'; }
     function renderStatus(status) {
-      const last = status.last_run;
-      nodes.agentId.textContent = status.agent_id || "-";
-      nodes.agentIdInput.value = status.agent_id || "";
-      nodes.scheduler.textContent = status.scheduler_enabled ? "Ligado" : "Desligado";
-      nodes.scheduler.className = status.scheduler_enabled ? "status-ok" : "status-bad";
-      nodes.running.textContent = status.running_cycle ? "Pingando" : "Livre";
-      nodes.running.className = status.running_cycle ? "status-warn" : "status-ok";
-      nodes.nextPing.textContent = status.next_scheduled_ping ? formatDate(status.next_scheduled_ping) : "Pausado";
-      nodes.lastSummary.textContent = last ? `${last.online_count} online / ${last.offline_count} offline` : "Sem execução";
-      nodes.startedAt.textContent = formatDate(status.started_at);
-      nodes.now.textContent = formatDate(status.now);
-      nodes.sourceMode.textContent = status.config?.source_mode || "-";
-      nodes.interval.textContent = `${status.config?.interval_minutes || "-"} minutos`;
-      nodes.timeout.textContent = `${status.config?.ping_timeout_ms || "-"} ms, ${status.config?.ping_attempts || "-"} tentativa(s)`;
-      nodes.log.textContent = JSON.stringify(status, null, 2);
+      const last = status.last_run || null; const identity = status.agent_identity || {};
+      nodes.agentId.textContent = status.agent_id || "-"; nodes.agentAutoIdInput.value = identity.auto_id || "maquina-01"; nodes.agentSuffixInput.value = sanitizeSuffix(identity.suffix || ""); syncFinalName();
+      nodes.scheduler.textContent = status.scheduler_enabled ? "Ligado" : "Desligado"; nodes.scheduler.className = status.scheduler_enabled ? "status-dot status-ok" : "status-dot status-bad"; nodes.schedulerHint.textContent = status.scheduler_enabled ? "Pings automaticos ativos" : "Pings automaticos pausados";
+      nodes.running.textContent = status.running_cycle ? "Pingando" : "Livre"; nodes.running.className = status.running_cycle ? "status-dot status-warn" : "status-dot status-ok"; nodes.runningHint.textContent = status.running_cycle ? "Ciclo em andamento" : "Pronto para novo ciclo";
+      nodes.nextPing.textContent = status.next_scheduled_ping ? formatShort(status.next_scheduled_ping) : "Pausado";
+      nodes.lastSummary.textContent = last ? `${last.online_count} online / ${last.offline_count} offline` : "Sem execucao"; nodes.lastFinished.textContent = last ? `Finalizado em ${formatDate(last.finished_at)}` : "Nenhum ping registrado nesta sessao";
+      nodes.equipmentCount.textContent = last ? last.equipment_count : "-"; nodes.onlineCount.textContent = last ? last.online_count : "-"; nodes.offlineCount.textContent = last ? last.offline_count : "-";
+      nodes.startedAt.textContent = formatDate(status.started_at); nodes.now.textContent = formatDate(status.now); nodes.sourceMode.textContent = status.config?.source_mode || "-"; nodes.interval.textContent = `${status.config?.interval_minutes || "-"} minutos`; nodes.timeout.textContent = `${status.config?.ping_timeout_ms || "-"} ms, ${status.config?.ping_attempts || "-"} tentativa(s)`;
+      renderAgents(status.active_agents, status.agent_id);
     }
-
-    async function requestStatus() {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (!response.ok) throw new Error(`Status ${response.status}`);
-      const status = await response.json();
-      renderStatus(status);
-      return status;
-    }
-
-    async function postAction(path) {
-      setBusy(true);
-      try {
-        const response = await fetch(path, { method: "POST", cache: "no-store" });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.message || `Erro ${response.status}`);
-        if (path.includes("force")) {
-          await requestStatus();
-        } else {
-          renderStatus(payload);
-        }
-      } catch (error) {
-        nodes.log.textContent = `Erro: ${error.message}`;
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    async function saveConfig() {
-      setBusy(true);
-      nodes.configMessage.textContent = "Salvando...";
-      try {
-        const response = await fetch("/api/config", {
-          method: "POST",
-          cache: "no-store",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ agent_id: nodes.agentIdInput.value }),
-        });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.message || `Erro ${response.status}`);
-        renderStatus(payload);
-        nodes.configMessage.textContent = "ID salvo no .env e aplicado no agente em execução.";
-      } catch (error) {
-        nodes.configMessage.textContent = `Erro: ${error.message}`;
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    function showTab(name) {
-      document.querySelectorAll(".tab-button").forEach((button) => {
-        button.classList.toggle("is-active", button.dataset.tab === name);
-      });
-      document.querySelectorAll(".tab-panel").forEach((panel) => {
-        panel.hidden = panel.id !== `tab-${name}`;
-      });
-    }
-
-    nodes.startButton.addEventListener("click", () => postAction("/api/start"));
-    nodes.stopButton.addEventListener("click", () => postAction("/api/stop"));
-    nodes.forceButton.addEventListener("click", () => postAction("/api/force-ping"));
-    nodes.saveConfigButton.addEventListener("click", saveConfig);
-    nodes.refreshButton.addEventListener("click", () => requestStatus().catch((error) => {
-      nodes.log.textContent = `Erro: ${error.message}`;
-    }));
-    document.querySelectorAll(".tab-button").forEach((button) => {
-      button.addEventListener("click", () => showTab(button.dataset.tab));
-    });
-
-    requestStatus().catch((error) => {
-      nodes.log.textContent = `Erro ao carregar status: ${error.message}`;
-    });
-    window.setInterval(() => {
-      if (!nodes.forceButton.disabled) requestStatus().catch(() => {});
-    }, 10000);
+    async function requestStatus() { const response = await fetch("/api/status", { cache: "no-store" }); if (!response.ok) throw new Error(`Status ${response.status}`); const status = await response.json(); renderStatus(status); return status; }
+    async function postAction(path) { setBusy(true); try { const response = await fetch(path, { method: "POST", cache: "no-store" }); const payload = await response.json(); if (!response.ok) throw new Error(payload.message || `Erro ${response.status}`); if (path.includes("force")) await requestStatus(); else renderStatus(payload); } catch (error) { nodes.configMessage.textContent = `Erro: ${error.message}`; } finally { setBusy(false); } }
+    async function saveConfig() { setBusy(true); nodes.configMessage.textContent = "Salvando..."; try { syncFinalName(); const response = await fetch("/api/config", { method: "POST", cache: "no-store", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agent_suffix: nodes.agentSuffixInput.value }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.message || `Erro ${response.status}`); renderStatus(payload); nodes.configMessage.textContent = "Nome salvo no .env e aplicado no agente em execucao."; } catch (error) { nodes.configMessage.textContent = `Erro: ${error.message}`; } finally { setBusy(false); } }
+    nodes.agentSuffixInput.addEventListener("input", syncFinalName); nodes.startButton.addEventListener("click", () => postAction("/api/start")); nodes.stopButton.addEventListener("click", () => postAction("/api/stop")); nodes.forceButton.addEventListener("click", () => postAction("/api/force-ping")); nodes.refreshButton.addEventListener("click", () => requestStatus().catch((error) => nodes.configMessage.textContent = `Erro: ${error.message}`)); nodes.saveConfigButton.addEventListener("click", saveConfig);
+    requestStatus().catch((error) => { nodes.configMessage.textContent = `Erro ao carregar status: ${error.message}`; }); window.setInterval(() => { if (!nodes.forceButton.disabled) requestStatus().catch(() => {}); }, 10000);
   </script>
 </body>
 </html>"""
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agente de ping para equipamentos Motiva Parana.")
@@ -959,3 +822,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
