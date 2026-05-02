@@ -1,0 +1,12 @@
+AGENTE DE MONITORAMENTO - USO RAPIDO
+
+1. Para iniciar em segundo plano:
+   INICIAR_AGENTE_DISCRETO.vbs
+
+2. Para abrir a tela local:
+   ABRIR_INTERFACE.vbs
+
+3. Para parar o agente discreto:
+   PARAR_AGENTE_DISCRETO.vbs
+
+Observacao: a pasta python-portatil e opcional. Se houver Python instalado no Windows, o agente usa ele automaticamente.
