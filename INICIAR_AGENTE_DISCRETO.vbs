@@ -10,28 +10,26 @@ Function IsAgentRunning()
 End Function
 
 agentFolder = filesystem.GetParentFolderName(WScript.ScriptFullName)
-agentScript = agentFolder & "\agent.py"
-portablePythonw = agentFolder & "\python-portatil\pythonw.exe"
-portablePython = agentFolder & "\python-portatil\python.exe"
+starterScript = agentFolder & "\INICIAR_AGENTE.bat"
+logsFolder = agentFolder & "\logs"
+logFile = logsFolder & "\agent-discreto.log"
+
+If Not filesystem.FolderExists(logsFolder) Then
+  filesystem.CreateFolder(logsFolder)
+End If
 
 If IsAgentRunning() Then
   shell.Popup "O agente discreto ja esta rodando nesta maquina.", 4, "Agente de Monitoramento", 64
   WScript.Quit
 End If
 
-If filesystem.FileExists(portablePythonw) Then
-  command = """" & portablePythonw & """ """ & agentScript & """ run"
-ElseIf filesystem.FileExists(portablePython) Then
-  command = """" & portablePython & """ """ & agentScript & """ run"
-Else
-  command = "cmd.exe /c ""cd /d """"" & agentFolder & """"" && (python """"" & agentScript & """"" run || py -3 """"" & agentScript & """"" run)"""
-End If
+command = "cmd.exe /c """"" & starterScript & """"""
 
 shell.Run command, 0, False
-WScript.Sleep 1800
+WScript.Sleep 5000
 
 If IsAgentRunning() Then
   shell.Popup "Agente discreto iniciado. A interface local ja pode ser aberta.", 5, "Agente de Monitoramento", 64
 Else
-  shell.Popup "O acionamento foi enviado, mas o agente ainda nao respondeu na porta 8765. Aguarde alguns segundos e tente abrir a interface.", 7, "Agente de Monitoramento", 48
+  shell.Popup "O agente nao iniciou na porta 8765. Verifique o arquivo logs\agent-discreto.log dentro da pasta do agente.", 9, "Agente de Monitoramento", 48
 End If
